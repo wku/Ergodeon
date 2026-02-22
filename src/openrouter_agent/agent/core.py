@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Awaitable
 from openai import AsyncOpenAI
@@ -15,17 +16,15 @@ from openrouter_agent.agent.doc_generator import DocumentGenerator
 from openrouter_agent.agent.sandbox import Sandbox
 from openrouter_agent.agent.config import PipelineConfig
 from openrouter_agent.agent.prompts import PROMPT_EXECUTE_STEP
-from openrouter_agent.utils import find_balanced_json
+from openrouter_agent.utils import find_balanced_json, load_yaml
 
 log = logging.getLogger(__name__)
 
-# Инструменты, требующие подтверждения пользователя
 DANGEROUS_TOOLS = {
     "write_file", "delete_file", "edit_file", "edit_file_by_lines",
-    "move_file", "execute_command", "multi_edit_file"
+    "move_file", "execute_command", "multi_edit_file",
 }
 
-# Аргументы-пути, которые нужно нормализовывать и проверять
 PATH_ARGS = {"path", "directory", "source", "destination", "cwd"}
 
 
@@ -40,8 +39,6 @@ def get_latest_stage_version(project_dir: str) -> tuple[int, int]:
     if max_stage == 0:
         return 0, 0
     stage_dir = os.path.join(base, f"стейдж-{max_stage}")
-    if not os.path.exists(stage_dir):
-        return max_stage, 0
     versions = [d for d in os.listdir(stage_dir) if d.startswith("версия-") and os.path.isdir(os.path.join(stage_dir, d))]
     if not versions:
         return max_stage, 0
@@ -49,18 +46,20 @@ def get_latest_stage_version(project_dir: str) -> tuple[int, int]:
     return max_stage, max_version
 
 
+def _docs_dir_path(project_dir: str, stage: int, version: int) -> str:
+    return os.path.join(project_dir, "флоу-разработки", f"стейдж-{stage}", f"версия-{version}")
+
+
 def _resolve_and_guard(raw_path: str, project_dir: str) -> str:
     """
-    Разрешает путь относительно project_dir и проверяет,
-    что результат находится внутри project_dir.
-    Выбрасывает ValueError если путь выходит за пределы проекта.
+    Разрешает путь и проверяет что он внутри project_dir.
+    Выбрасывает ValueError если нет.
     """
     project_root = Path(project_dir).resolve()
     if not os.path.isabs(raw_path):
         resolved = (project_root / raw_path).resolve()
     else:
         resolved = Path(raw_path).resolve()
-
     try:
         resolved.relative_to(project_root)
     except ValueError:
@@ -69,6 +68,10 @@ def _resolve_and_guard(raw_path: str, project_dir: str) -> str:
             f"Все операции с файлами разрешены только внутри {project_root}."
         )
     return str(resolved)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class Agent:
@@ -94,7 +97,7 @@ class Agent:
             "You can read and write files, execute commands, and more."
         )
         self.confirmation_callback = confirmation_callback
-        self.active_project_dir: str | None = None  # фиксируется после run_pipeline
+        self.active_project_dir: str | None = None
 
         self.intent_classifier = IntentClassifier()
         self.memory = EpisodeMemory(memory_path)
@@ -104,6 +107,8 @@ class Agent:
         self.pipeline_config = pipeline_config or PipelineConfig()
 
         log.info(f"agent initialized, model={model}, memory={memory_path}")
+
+    # ------------------------------------------------------------------ public API
 
     async def detect_pipeline_request(self, user_input: str) -> bool:
         intent = await self.intent_classifier.classify_with_llm(user_input, self.client, self.model)
@@ -124,12 +129,9 @@ class Agent:
             )
             raw = r.choices[0].message.content or ""
             js = find_balanced_json(raw)
-            if js:
-                name = json.loads(js).get("dir_name", "new_project")
-            else:
-                name = "new_project"
+            name = json.loads(js).get("dir_name", "new_project") if js else "new_project"
         except Exception as e:
-            log.warning(f"Error generating name: {e}")
+            log.warning(f"error generating project name: {e}")
             name = "new_project"
 
         name = f"{name}_{int(time.time())}"
@@ -146,37 +148,238 @@ class Agent:
         if similar:
             log.info(f"similar episode found: {similar.get('goal', '')[:80]}")
 
-        # Если активен проект - добавляем контекст в историю чтобы агент знал где работать
-        if self.active_project_dir and (
-            not self.history or
-            not any("active_project_dir" in str(m.get("content", "")) for m in self.history[-3:])
+        if self.active_project_dir and not any(
+            "active_project_dir" in str(m.get("content", "")) for m in self.history[-3:]
         ):
             self.history.append({
                 "role": "system",
                 "content": (
                     f"Текущий активный проект: {self.active_project_dir}\n"
                     f"ВСЕ файловые операции выполнять ТОЛЬКО внутри этой директории. "
-                    f"Абсолютно запрещено создавать или изменять файлы вне {self.active_project_dir}."
-                )
+                    f"Запрещено создавать или изменять файлы вне {self.active_project_dir}."
+                ),
             })
 
         self.history.append({"role": "user", "content": user_input})
-
         start_time = time.time()
-        # Всегда передаём active_project_dir в _step для защиты путей
         response = await self._step(project_dir=self.active_project_dir)
         elapsed = time.time() - start_time
 
         self.memory.add({
-            "goal": user_input,
-            "intent": intent,
+            "goal": user_input, "intent": intent,
             "response_preview": response[:200] if response else "",
-            "elapsed": round(elapsed, 2),
+            "elapsed": round(elapsed, 2), "timestamp": time.time(),
+        })
+        log.info(f"chat completed in {elapsed:.1f}s")
+        return response
+
+    # ------------------------------------------------------------------ resume_pipeline
+
+    async def resume_pipeline(
+        self,
+        project_dir: str,
+        stage: int | None = None,
+        version: int | None = None,
+        review_callback: Callable[[str], Awaitable[str]] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Продолжает выполнение прерванного пайплайна.
+
+        Алгоритм:
+        1. Если stage/version не указаны - берёт последний стейдж/версию.
+        2. Читает implementation_plan.yaml (или .json legacy).
+        3. Читает execution_log.yaml - строит множество completed_ids.
+        4. Запускает цикл выполнения только для незавершённых шагов.
+        5. Сохраняет обновлённый лог.
+        """
+        self.active_project_dir = os.path.abspath(project_dir)
+
+        if stage is None or version is None:
+            max_stage, max_version = get_latest_stage_version(project_dir)
+            if max_stage == 0:
+                return {"status": "error", "error": "Не найдено ни одного стейджа. Запустите run_pipeline сначала."}
+            stage = stage or max_stage
+            version = version or max_version
+
+        docs_dir = _docs_dir_path(project_dir, stage, version)
+        log.info(f"resume_pipeline: project={project_dir}, stage={stage}, version={version}")
+
+        # Загружаем план
+        plan = self.doc_generator.load_plan(docs_dir)
+        if not plan:
+            return {
+                "status": "error",
+                "error": f"implementation_plan не найден в {docs_dir}. Невозможно продолжить.",
+            }
+
+        # Загружаем чеклист для зависимостей
+        checklist = self.doc_generator.load_checklist(docs_dir) or {}
+
+        # Строим множество выполненных шагов из лога
+        existing_log = self.doc_generator.load_execution_log(docs_dir)
+        completed_ids: set[str] = set()
+        previous_entries: List[Dict] = []
+
+        if existing_log:
+            for entry in existing_log.get("steps", []):
+                if entry.get("status") == "completed":
+                    completed_ids.add(str(entry.get("checklist_id", "")))
+            previous_entries = existing_log.get("steps", [])
+            log.info(f"resume: найдено {len(completed_ids)} выполненных шагов: {completed_ids}")
+        else:
+            log.info("resume: лог не найден, выполняем все шаги")
+
+        steps = plan.get("steps", [])
+        pending_steps = [
+            s for s in steps
+            if str(s.get("checklist_id", "")) not in completed_ids
+        ]
+
+        if not pending_steps:
+            log.info("resume: все шаги уже выполнены")
+            return {
+                "status": "success",
+                "message": "Все шаги уже выполнены.",
+                "stages": {"execution": previous_entries},
+            }
+
+        log.info(f"resume: {len(pending_steps)} шагов к выполнению из {len(steps)} всего")
+
+        # Формируем digest строку для промтов
+        from openrouter_agent.utils import load_yaml as _load_yaml
+        digest_data = _load_yaml(os.path.join(docs_dir, "project_digest.yaml")) or {}
+        digest_str = json.dumps(digest_data, ensure_ascii=False)
+
+        result = {
+            "status": "started",
+            "stage": stage,
+            "version": version,
+            "stages": {},
+        }
+
+        # Метаданные для лога
+        log_meta = {
+            "project_dir": project_dir,
+            "stage": stage,
+            "version": version,
+            "resumed_at": _now_iso(),
+            "status": "running",
+            "total_steps": len(steps),
+            "skipped_completed": len(completed_ids),
+        }
+
+        execution_log = list(previous_entries)  # сохраняем историю предыдущего запуска
+        failed_ids: set[str] = set()
+
+        for step in pending_steps:
+            step_num = step.get("step_number", "?")
+            cid = str(step.get("checklist_id", ""))
+            desc = step.get("description", "")
+
+            # Проверяем зависимости
+            deps: set[str] = set()
+            for task in checklist.get("checklist", []):
+                if str(task.get("id")) == cid:
+                    deps = set(str(d) for d in task.get("depends_on", []))
+                    break
+
+            if deps & failed_ids:
+                log.warning(f"step {step_num} blocked: dependency failed")
+                execution_log.append({
+                    "step_number": step_num, "checklist_id": cid,
+                    "description": desc, "status": "blocked",
+                    "elapsed": 0, "error": "dependency failed",
+                })
+                self.doc_generator.save_execution_log(docs_dir, execution_log, {**log_meta, "status": "running"})
+                continue
+
+            log.info(f"resume: выполняю шаг {step_num}: {desc}")
+            start = time.time()
+            status = "completed"
+            error = ""
+
+            for attempt in range(self.pipeline_config.max_retry_per_step):
+                try:
+                    step_prompt = json.dumps(step, ensure_ascii=False)
+                    prompt = PROMPT_EXECUTE_STEP.format(
+                        step=step_prompt,
+                        project_digest=digest_str,
+                        current_file_content="Определи сам в процессе",
+                        previous_steps_log=json.dumps(execution_log[-10:], ensure_ascii=False),
+                    )
+                    system_instruction = (
+                        f"You are executing a step in the implementation plan.\n"
+                        f"CRITICAL: The absolute root directory for this project is {project_dir}\n"
+                        f"ALL file paths MUST point inside {project_dir}. "
+                        f"It is STRICTLY FORBIDDEN to create or modify files outside {project_dir}."
+                    )
+                    self.history.append({"role": "system", "content": system_instruction})
+                    self.history.append({"role": "user", "content": prompt})
+                    await self._step(project_dir=project_dir)
+                    status = "completed"
+                    completed_ids.add(cid)
+                    error = ""
+                    self.doc_generator.mark_step_completed(docs_dir, cid, step_num)
+                    break
+                except Exception as e:
+                    log.error(f"step {step_num} attempt {attempt + 1} error: {e}")
+                    error = str(e)
+                    status = "failed"
+
+            if status == "failed":
+                failed_ids.add(cid)
+
+            elapsed = time.time() - start
+            execution_log.append({
+                "step_number": step_num, "checklist_id": cid,
+                "description": desc, "status": status,
+                "elapsed": round(elapsed, 2), "error": error,
+            })
+
+            # Сохраняем лог после каждого шага чтобы прерывание не теряло прогресс
+            self.doc_generator.save_execution_log(
+                docs_dir, execution_log,
+                {**log_meta, "status": "running"},
+            )
+
+        # Финальный статус
+        total = len(steps)
+        completed = sum(1 for e in execution_log if e["status"] == "completed")
+        failed = sum(1 for e in execution_log if e["status"] == "failed")
+        blocked = sum(1 for e in execution_log if e["status"] == "blocked")
+        failed_pct = (failed / max(total, 1)) * 100
+
+        if failed_pct > self.pipeline_config.failed_tasks_threshold_percent:
+            result["status"] = "critical_failure"
+        elif failed > 0:
+            result["status"] = "partial_success"
+        else:
+            result["status"] = "success"
+
+        log_meta["status"] = result["status"]
+        log_meta["finished_at"] = _now_iso()
+        self.doc_generator.save_execution_log(docs_dir, execution_log, log_meta)
+
+        result["stages"]["execution"] = execution_log
+        result["stages"]["verification"] = {
+            "total": total, "completed": completed,
+            "failed": failed, "blocked": blocked,
+            "failed_percent": round(failed_pct, 1),
+        }
+
+        self.memory.add({
+            "goal": f"resume stage={stage} version={version}",
+            "intent": "resume",
+            "project": project_dir,
+            "status": result["status"],
+            "stats": result["stages"]["verification"],
             "timestamp": time.time(),
         })
 
-        log.info(f"chat completed in {elapsed:.1f}s, intent={intent}")
-        return response
+        log.info(f"resume_pipeline finished: {result['status']}")
+        return result
+
+    # ------------------------------------------------------------------ run_pipeline
 
     async def run_pipeline(
         self,
@@ -185,44 +388,38 @@ class Agent:
         review_callback: Callable[[str], Awaitable[str]] | None = None,
     ) -> Dict[str, Any]:
         log.info(f"pipeline started: project={project_dir}, goal={goal[:100]}")
-
-        # Фиксируем активный проект на весь сеанс
         self.active_project_dir = os.path.abspath(project_dir)
-
         result = {"status": "started", "stages": {}}
 
         max_stage, max_version = get_latest_stage_version(project_dir)
         old_context = ""
 
         if max_stage > 0 and max_version > 0:
-            docs_dir = os.path.join(project_dir, "флоу-разработки", f"стейдж-{max_stage}", f"версия-{max_version}")
-            try:
-                with open(os.path.join(docs_dir, "parsed_request.json"), "r", encoding="utf-8") as f:
-                    old_req = f.read()
-                old_context += f"ПРЕДЫДУЩИЙ ЗАПРОС:\n{old_req}\n\n"
-            except FileNotFoundError:
-                pass
-            try:
-                with open(os.path.join(docs_dir, "checklist.json"), "r", encoding="utf-8") as f:
-                    old_cl = f.read()
+            prev_docs_dir = _docs_dir_path(project_dir, max_stage, max_version)
+
+            parsed_req = self.doc_generator.load_plan(prev_docs_dir)  # reuse loader
+            # Загружаем parsed_request отдельно
+            from openrouter_agent.utils import load_yaml as _ly
+            old_req = _ly(os.path.join(prev_docs_dir, "parsed_request.yaml"))
+            if old_req:
+                old_context += f"ПРЕДЫДУЩИЙ ЗАПРОС:\n{json.dumps(old_req, ensure_ascii=False)}\n\n"
+            old_cl = self.doc_generator.load_checklist(prev_docs_dir)
+            if old_cl:
                 old_context += (
-                    f"ТЕКУЩИЙ ЧЕКЛИСТ:\n{old_cl}\n\n"
+                    f"ТЕКУЩИЙ ЧЕКЛИСТ:\n{json.dumps(old_cl, ensure_ascii=False)}\n\n"
                     "ВАЖНО: Добавь новые задачи в этот чеклист. Старые задачи сохрани как есть (если они не отменены)!"
                 )
-            except FileNotFoundError:
-                pass
+
             current_stage = max_stage + 1
         else:
             current_stage = 1
 
         current_version = 1
-        docs_dir = os.path.join(
-            project_dir, "флоу-разработки", f"стейдж-{current_stage}", f"версия-{current_version}"
-        )
+        docs_dir = _docs_dir_path(project_dir, current_stage, current_version)
 
+        # Стадия 1
         log.info("stage 1: parsing request")
         goal_with_ctx = f"Новый запрос: {goal}\n\n---\nИстория проекта:\n{old_context}" if old_context else goal
-
         parsed = await self.doc_generator.parse_request(goal_with_ctx, "", self.client, self.model)
         result["stages"]["parse_request"] = parsed
         if parsed.get("clarification_needed"):
@@ -230,6 +427,7 @@ class Agent:
             result["questions"] = parsed["clarification_needed"]
             return result
 
+        # Стадия 2-3
         log.info("stage 2-3: scanning project and generating digest")
         files = self.scanner.scan(project_dir)
         prioritized = self.scanner.prioritize(files, goal)
@@ -243,16 +441,14 @@ class Agent:
         )
         result["stages"]["digest"] = digest
 
+        # Стадия 4
         log.info("stage 4: generating documents")
         parsed_str = json.dumps(parsed, ensure_ascii=False)
         digest_str = json.dumps(digest, ensure_ascii=False)
 
-        checklist = await self.doc_generator.generate_checklist(
-            digest_str, parsed_str, self.client, self.model,
-        )
+        checklist = await self.doc_generator.generate_checklist(digest_str, parsed_str, self.client, self.model)
         walkthrough = await self.doc_generator.generate_walkthrough(
-            digest_str, parsed_str, json.dumps(checklist, ensure_ascii=False),
-            self.client, self.model,
+            digest_str, parsed_str, json.dumps(checklist, ensure_ascii=False), self.client, self.model,
         )
         plan = await self.doc_generator.generate_plan(
             digest_str, parsed_str,
@@ -265,36 +461,29 @@ class Agent:
         if not valid:
             log.warning(f"document validation issues: {issues}")
 
-        docs = {
-            "parsed_request": parsed,
-            "digest": digest,
-            "checklist": checklist,
-            "walkthrough": walkthrough,
-            "plan": plan,
-        }
+        docs = {"parsed_request": parsed, "digest": digest,
+                "checklist": checklist, "walkthrough": walkthrough, "plan": plan}
         self.doc_generator.save_to_project(docs_dir, docs)
         result["stages"]["documents"] = {"path": docs_dir, "valid": valid, "issues": issues}
 
+        # Стадия 5 - ревью
         if review_callback:
             log.info("stage 5: requesting review")
             review_iterations = 0
             while review_iterations < self.pipeline_config.max_review_iterations:
                 review_iterations += 1
                 comments_cli = await review_callback(
-                    f"Документы сгенерированы в {docs_dir}. "
-                    f"Проверьте checklist.md, walkthrough.md, implementation_plan.md.\n"
-                    f"Оставьте `<!-- COMMENT: текст -->` прямо в файлах (будут удалены после прочтения агентом)\n"
-                    f"Или напишите комментарии ниже в чате. Отправьте комментарии или напишите 'ok' для продолжения."
+                    f"Документы сгенерированы в:\n{docs_dir}\n\n"
+                    f"Откройте checklist.md, walkthrough.md, implementation_plan.md.\n"
+                    f"Оставьте <!-- COMMENT: текст --> прямо в файлах или напишите комментарии здесь.\n"
+                    f"Пустой ввод или 'ok' - продолжить выполнение."
                 )
-
                 inline_comments = self.doc_generator.extract_inline_comments(docs_dir)
-
                 all_comments = []
                 if comments_cli and comments_cli.strip().lower() not in ("ok", "approved", "да", ""):
                     all_comments.append(f"Комментарии из чата:\n{comments_cli}")
                 if inline_comments:
-                    all_comments.append(f"Inline комментарии из документов:\n{inline_comments}")
-
+                    all_comments.append(f"Inline комментарии:\n{inline_comments}")
                 comments = "\n\n".join(all_comments)
 
                 if not comments:
@@ -319,18 +508,13 @@ class Agent:
                 to_regen = review_result.get("documents_to_regenerate", [])
                 if to_regen:
                     current_version += 1
-                    docs_dir = os.path.join(
-                        project_dir, "флоу-разработки",
-                        f"стейдж-{current_stage}", f"версия-{current_version}"
-                    )
+                    docs_dir = _docs_dir_path(project_dir, current_stage, current_version)
                     if "checklist" in to_regen:
                         checklist = await self.doc_generator.generate_checklist(
-                            digest_str, parsed_str + f"\nКомментарии: {comments}",
-                            self.client, self.model,
+                            digest_str, parsed_str + f"\nКомментарии: {comments}", self.client, self.model,
                         )
                         walkthrough = await self.doc_generator.generate_walkthrough(
-                            digest_str, parsed_str,
-                            json.dumps(checklist, ensure_ascii=False),
+                            digest_str, parsed_str, json.dumps(checklist, ensure_ascii=False),
                             self.client, self.model,
                         )
                         plan = await self.doc_generator.generate_plan(
@@ -342,8 +526,7 @@ class Agent:
                     elif "walkthrough" in to_regen:
                         walkthrough = await self.doc_generator.generate_walkthrough(
                             digest_str, parsed_str + f"\nКомментарии: {comments}",
-                            json.dumps(checklist, ensure_ascii=False),
-                            self.client, self.model,
+                            json.dumps(checklist, ensure_ascii=False), self.client, self.model,
                         )
                         plan = await self.doc_generator.generate_plan(
                             digest_str, parsed_str,
@@ -358,29 +541,34 @@ class Agent:
                             json.dumps(walkthrough, ensure_ascii=False),
                             self.client, self.model,
                         )
-
-                    docs["checklist"] = checklist
-                    docs["walkthrough"] = walkthrough
-                    docs["plan"] = plan
+                    docs.update({"checklist": checklist, "walkthrough": walkthrough, "plan": plan})
                     self.doc_generator.save_to_project(docs_dir, docs)
 
+        # Стадия 6 - имплементация
         log.info("stage 6: implementation")
-        result["stages"]["snapshot"] = "skipped"
 
-        execution_log = []
+        log_meta = {
+            "project_dir": project_dir,
+            "stage": current_stage,
+            "version": current_version,
+            "started_at": _now_iso(),
+            "status": "running",
+        }
+
+        execution_log: List[Dict] = []
         steps = plan.get("steps", [])
-        completed_ids = set()
-        failed_ids = set()
+        completed_ids: set[str] = set()
+        failed_ids: set[str] = set()
 
         for step in steps:
             step_num = step.get("step_number", "?")
-            cid = step.get("checklist_id", "")
+            cid = str(step.get("checklist_id", ""))
             desc = step.get("description", "")
 
-            deps = set()
+            deps: set[str] = set()
             for task in checklist.get("checklist", []):
-                if task.get("id") == cid:
-                    deps = set(task.get("depends_on", []))
+                if str(task.get("id")) == cid:
+                    deps = set(str(d) for d in task.get("depends_on", []))
                     break
 
             if deps & failed_ids:
@@ -390,6 +578,10 @@ class Agent:
                     "description": desc, "status": "blocked",
                     "elapsed": 0, "error": "dependency failed",
                 })
+                # Сохраняем прогресс немедленно
+                self.doc_generator.save_execution_log(
+                    docs_dir, execution_log, {**log_meta, "status": "running"},
+                )
                 continue
 
             log.info(f"Начинаю выполнение шага {step_num}: {desc}")
@@ -404,22 +596,18 @@ class Agent:
                         step=step_prompt,
                         project_digest=digest_str,
                         current_file_content="Определи сам в процессе",
-                        previous_steps_log=json.dumps(execution_log, ensure_ascii=False),
+                        previous_steps_log=json.dumps(execution_log[-10:], ensure_ascii=False),
                     )
-
                     system_instruction = (
                         f"You are executing a step in the implementation plan.\n"
                         f"CRITICAL: The absolute root directory for this project is {project_dir}\n"
-                        f"ALL file paths in your tool calls (write_file, edit_file, execute_command, etc.) "
-                        f"MUST point inside {project_dir}. "
+                        f"ALL file paths in your tool calls MUST point inside {project_dir}. "
                         f"It is STRICTLY FORBIDDEN to create or modify files outside {project_dir}. "
-                        f"If a relative path is given, treat it as relative to {project_dir}. "
-                        f"Use your tools strictly."
+                        f"Use relative paths only."
                     )
                     self.history.append({"role": "system", "content": system_instruction})
                     self.history.append({"role": "user", "content": prompt})
                     await self._step(project_dir=project_dir)
-
                     status = "completed"
                     completed_ids.add(cid)
                     error = ""
@@ -440,26 +628,33 @@ class Agent:
                 "elapsed": round(elapsed, 2), "error": error,
             })
 
-        self.doc_generator.save_execution_log(docs_dir, execution_log)
+            # Сохраняем лог после каждого шага
+            self.doc_generator.save_execution_log(
+                docs_dir, execution_log,
+                {**log_meta, "status": "running"},
+            )
+
         result["stages"]["execution"] = execution_log
 
+        # Стадия 7
         log.info("stage 7: final verification")
         total = len(steps)
         completed = sum(1 for e in execution_log if e["status"] == "completed")
         failed = sum(1 for e in execution_log if e["status"] == "failed")
         blocked = sum(1 for e in execution_log if e["status"] == "blocked")
-
         failed_pct = (failed / max(total, 1)) * 100
+
         if failed_pct > self.pipeline_config.failed_tasks_threshold_percent:
             result["status"] = "critical_failure"
-            log.error(
-                f"critical failure: {failed_pct:.0f}% tasks failed "
-                f"(threshold {self.pipeline_config.failed_tasks_threshold_percent}%)"
-            )
+            log.error(f"critical failure: {failed_pct:.0f}% tasks failed")
         elif failed > 0:
             result["status"] = "partial_success"
         else:
             result["status"] = "success"
+
+        log_meta["status"] = result["status"]
+        log_meta["finished_at"] = _now_iso()
+        self.doc_generator.save_execution_log(docs_dir, execution_log, log_meta)
 
         result["stages"]["verification"] = {
             "total": total, "completed": completed,
@@ -468,8 +663,7 @@ class Agent:
         }
 
         self.memory.add({
-            "goal": goal, "intent": "pipeline",
-            "project": project_dir,
+            "goal": goal, "intent": "pipeline", "project": project_dir,
             "status": result["status"],
             "stats": result["stages"]["verification"],
             "timestamp": time.time(),
@@ -478,12 +672,9 @@ class Agent:
         log.info(f"pipeline finished: {result['status']}")
         return result
 
+    # ------------------------------------------------------------------ _step
+
     async def _step(self, project_dir: str | None = None) -> str:
-        """
-        Один оборот ReAct-цикла. project_dir используется для:
-        1. Нормализации относительных путей в аргументах инструментов.
-        2. Жёсткой проверки что абсолютные пути не выходят за пределы проекта.
-        """
         messages = [{"role": "system", "content": self.system_prompt}] + self.history
         tools = self._get_openai_tools()
 
@@ -506,20 +697,17 @@ class Agent:
                     tool_args = json.loads(arguments_str)
 
                     if project_dir:
-                        # Нормализуем и проверяем все пути в аргументах
                         for k in list(tool_args.keys()):
                             if k in PATH_ARGS and isinstance(tool_args[k], str):
                                 try:
                                     tool_args[k] = _resolve_and_guard(tool_args[k], project_dir)
                                 except ValueError as path_err:
-                                    # Блокируем вызов инструмента - путь за пределами проекта
                                     log.error(str(path_err))
-                                    result = f"ERROR: {path_err}"
                                     self.history.append({
                                         "role": "tool",
                                         "tool_call_id": tool_call.id,
                                         "name": tool_name,
-                                        "content": result,
+                                        "content": f"ERROR: {path_err}",
                                     })
                                     continue
 
