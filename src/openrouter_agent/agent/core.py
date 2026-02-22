@@ -1,0 +1,368 @@
+import os
+import json
+import asyncio
+import logging
+import time
+from typing import List, Dict, Any, Optional, Callable, Awaitable
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
+from openrouter_agent.tools.registry import ToolRegistry
+from openrouter_agent.agent.intent import IntentClassifier
+from openrouter_agent.agent.memory import EpisodeMemory
+from openrouter_agent.agent.planner import Planner
+from openrouter_agent.agent.scanner import ProjectScanner
+from openrouter_agent.agent.doc_generator import DocumentGenerator
+from openrouter_agent.agent.sandbox import Sandbox
+from openrouter_agent.agent.config import PipelineConfig
+
+log = logging.getLogger(__name__)
+
+DANGEROUS_TOOLS = {
+    "write_file", "delete_file", "edit_file", "edit_file_by_lines",
+    "move_file", "execute_command", "multi_edit_file"
+}
+
+
+class Agent:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "openai/gpt-4o",
+        system_prompt: str | None = None,
+        confirmation_callback: Callable[[str, Any], Awaitable[bool]] | None = None,
+        memory_path: str = "memory/episodes.json",
+        pipeline_config: PipelineConfig = None,
+    ):
+        self.client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
+        self.model = model
+        self.api_key = api_key
+        self.tools_registry = ToolRegistry()
+        self.history: List[ChatCompletionMessageParam] = []
+        self.system_prompt = system_prompt or "You are a helpful AI coding assistant. You can read and write files, execute commands, and more."
+        self.confirmation_callback = confirmation_callback
+
+        self.intent_classifier = IntentClassifier()
+        self.memory = EpisodeMemory(memory_path)
+        self.planner = Planner()
+        self.scanner = ProjectScanner()
+        self.doc_generator = DocumentGenerator()
+        self.pipeline_config = pipeline_config or PipelineConfig()
+
+        log.info(f"agent initialized, model={model}, memory={memory_path}")
+
+    async def chat(self, user_input: str) -> str:
+        intent = self.intent_classifier.classify(user_input)
+        log.info(f"intent: {intent}, input: {user_input[:100]}")
+
+        similar = self.memory.find_similar(user_input)
+        if similar:
+            log.info(f"similar episode found: {similar.get('goal', '')[:80]}")
+
+        self.history.append({"role": "user", "content": user_input})
+
+        start_time = time.time()
+        response = await self._step()
+        elapsed = time.time() - start_time
+
+        self.memory.add({
+            "goal": user_input,
+            "intent": intent,
+            "response_preview": response[:200] if response else "",
+            "elapsed": round(elapsed, 2),
+            "timestamp": time.time(),
+        })
+
+        log.info(f"chat completed in {elapsed:.1f}s, intent={intent}")
+        return response
+
+    async def run_pipeline(
+        self,
+        project_dir: str,
+        goal: str,
+        review_callback: Callable[[str], Awaitable[str]] | None = None,
+    ) -> Dict[str, Any]:
+        log.info(f"pipeline started: project={project_dir}, goal={goal[:100]}")
+        result = {"status": "started", "stages": {}}
+
+        # etap 1 - parsning zaprosa
+        log.info("stage 1: parsing request")
+        parsed = await self.doc_generator.parse_request(goal, "", self.client, self.model)
+        result["stages"]["parse_request"] = parsed
+        if parsed.get("clarification_needed"):
+            result["status"] = "needs_clarification"
+            result["questions"] = parsed["clarification_needed"]
+            return result
+
+        # etap 2-3 - issledovanie proekta i digest
+        log.info("stage 2-3: scanning project and generating digest")
+        files = self.scanner.scan(project_dir)
+        prioritized = self.scanner.prioritize(files, goal)
+        file_tree = self.scanner.get_file_tree(files)
+        file_contents = self.scanner.read_files(prioritized)
+        contents_str = "\n\n".join(f"--- {k} ---\n{v}" for k, v in file_contents.items())
+
+        digest = await self.doc_generator.generate_digest(
+            file_tree, contents_str, json.dumps(parsed, ensure_ascii=False),
+            self.client, self.model,
+        )
+        result["stages"]["digest"] = digest
+
+        # etap 4 - generaciya 3 dokumentov
+        log.info("stage 4: generating documents")
+        parsed_str = json.dumps(parsed, ensure_ascii=False)
+        digest_str = json.dumps(digest, ensure_ascii=False)
+
+        checklist = await self.doc_generator.generate_checklist(
+            digest_str, parsed_str, self.client, self.model,
+        )
+        walkthrough = await self.doc_generator.generate_walkthrough(
+            digest_str, parsed_str, json.dumps(checklist, ensure_ascii=False),
+            self.client, self.model,
+        )
+        plan = await self.doc_generator.generate_plan(
+            digest_str, parsed_str,
+            json.dumps(checklist, ensure_ascii=False),
+            json.dumps(walkthrough, ensure_ascii=False),
+            self.client, self.model,
+        )
+
+        valid, issues = self.doc_generator.validate_documents(checklist, walkthrough, plan)
+        if not valid:
+            log.warning(f"document validation issues: {issues}")
+
+        docs = {
+            "parsed_request": parsed,
+            "digest": digest,
+            "checklist": checklist,
+            "walkthrough": walkthrough,
+            "plan": plan,
+        }
+        docs_dir = self.doc_generator.save_to_project(project_dir, docs)
+        result["stages"]["documents"] = {"path": docs_dir, "valid": valid, "issues": issues}
+
+        # etap 5 - revyu klientom
+        if review_callback:
+            log.info("stage 5: requesting review")
+            for iteration in range(self.pipeline_config.max_review_iterations):
+                comments = await review_callback(
+                    f"Документы сгенерированы в {docs_dir}. "
+                    f"Проверьте checklist.md, walkthrough.md, implementation_plan.md. "
+                    f"Оставьте комментарии или напишите 'ok' для продолжения."
+                )
+                if not comments or comments.strip().lower() in ("ok", "approved", "да"):
+                    log.info("review: approved")
+                    break
+                log.info(f"review iteration {iteration+1}: processing comments")
+                review_result = await self.doc_generator.parse_review_comments(
+                    comments,
+                    json.dumps(checklist, ensure_ascii=False),
+                    json.dumps(walkthrough, ensure_ascii=False),
+                    json.dumps(plan, ensure_ascii=False),
+                    self.client, self.model,
+                )
+                overall = review_result.get("overall_status", "needs_revision")
+                if overall == "approved":
+                    break
+                if overall == "rejected":
+                    result["status"] = "rejected"
+                    return result
+
+                to_regen = review_result.get("documents_to_regenerate", [])
+                if "checklist" in to_regen:
+                    checklist = await self.doc_generator.generate_checklist(
+                        digest_str, parsed_str + f"\nКомментарии: {comments}",
+                        self.client, self.model,
+                    )
+                    walkthrough = await self.doc_generator.generate_walkthrough(
+                        digest_str, parsed_str,
+                        json.dumps(checklist, ensure_ascii=False),
+                        self.client, self.model,
+                    )
+                    plan = await self.doc_generator.generate_plan(
+                        digest_str, parsed_str,
+                        json.dumps(checklist, ensure_ascii=False),
+                        json.dumps(walkthrough, ensure_ascii=False),
+                        self.client, self.model,
+                    )
+                elif "walkthrough" in to_regen:
+                    walkthrough = await self.doc_generator.generate_walkthrough(
+                        digest_str, parsed_str + f"\nКомментарии: {comments}",
+                        json.dumps(checklist, ensure_ascii=False),
+                        self.client, self.model,
+                    )
+                    plan = await self.doc_generator.generate_plan(
+                        digest_str, parsed_str,
+                        json.dumps(checklist, ensure_ascii=False),
+                        json.dumps(walkthrough, ensure_ascii=False),
+                        self.client, self.model,
+                    )
+                elif "implementation_plan" in to_regen:
+                    plan = await self.doc_generator.generate_plan(
+                        digest_str, parsed_str + f"\nКомментарии: {comments}",
+                        json.dumps(checklist, ensure_ascii=False),
+                        json.dumps(walkthrough, ensure_ascii=False),
+                        self.client, self.model,
+                    )
+
+                docs["checklist"] = checklist
+                docs["walkthrough"] = walkthrough
+                docs["plan"] = plan
+                self.doc_generator.save_to_project(project_dir, docs)
+
+        # etap 6 - implementaciya
+        log.info("stage 6: implementation")
+        snapshot_dir = Sandbox.snapshot(project_dir, os.path.join(
+            project_dir, self.pipeline_config.docs_dir_name,
+        ))
+        result["stages"]["snapshot"] = snapshot_dir
+
+        execution_log = []
+        steps = plan.get("steps", [])
+        completed_ids = set()
+        failed_ids = set()
+
+        for step in steps:
+            step_num = step.get("step_number", "?")
+            cid = step.get("checklist_id", "")
+            desc = step.get("description", "")
+
+            deps = set()
+            for task in checklist.get("checklist", []):
+                if task.get("id") == cid:
+                    deps = set(task.get("depends_on", []))
+                    break
+
+            if deps & failed_ids:
+                log.warning(f"step {step_num} blocked: dependency failed")
+                execution_log.append({
+                    "step_number": step_num, "checklist_id": cid,
+                    "description": desc, "status": "blocked",
+                    "elapsed": 0, "error": "dependency failed",
+                })
+                continue
+
+            start = time.time()
+            status = "completed"
+            error = ""
+
+            for attempt in range(self.pipeline_config.max_retry_per_step):
+                try:
+                    step_prompt = json.dumps(step, ensure_ascii=False)
+                    response = await self.chat(
+                        f"Выполни следующий шаг плана имплементации в проекте {project_dir}:\n{step_prompt}"
+                    )
+                    status = "completed"
+                    completed_ids.add(cid)
+                    error = ""
+                    break
+                except Exception as e:
+                    log.error(f"step {step_num} attempt {attempt+1} error: {e}")
+                    error = str(e)
+                    status = "failed"
+
+            if status == "failed":
+                failed_ids.add(cid)
+
+            elapsed = time.time() - start
+            execution_log.append({
+                "step_number": step_num, "checklist_id": cid,
+                "description": desc, "status": status,
+                "elapsed": round(elapsed, 2), "error": error,
+            })
+
+        self.doc_generator.save_execution_log(project_dir, execution_log)
+        result["stages"]["execution"] = execution_log
+
+        # etap 7 - finalnaya verifikaciya
+        log.info("stage 7: final verification")
+        total = len(steps)
+        completed = sum(1 for e in execution_log if e["status"] == "completed")
+        failed = sum(1 for e in execution_log if e["status"] == "failed")
+        blocked = sum(1 for e in execution_log if e["status"] == "blocked")
+
+        failed_pct = (failed / max(total, 1)) * 100
+        if failed_pct > self.pipeline_config.failed_tasks_threshold_percent:
+            result["status"] = "critical_failure"
+            log.error(f"critical failure: {failed_pct:.0f}% tasks failed (threshold {self.pipeline_config.failed_tasks_threshold_percent}%)")
+        elif failed > 0:
+            result["status"] = "partial_success"
+        else:
+            result["status"] = "success"
+
+        result["stages"]["verification"] = {
+            "total": total, "completed": completed,
+            "failed": failed, "blocked": blocked,
+            "failed_percent": round(failed_pct, 1),
+        }
+
+        self.memory.add({
+            "goal": goal, "intent": "pipeline",
+            "project": project_dir,
+            "status": result["status"],
+            "stats": result["stages"]["verification"],
+            "timestamp": time.time(),
+        })
+
+        log.info(f"pipeline finished: {result['status']}")
+        return result
+
+    async def _step(self) -> str:
+        messages = [{"role": "system", "content": self.system_prompt}] + self.history
+        tools = self._get_openai_tools()
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=tools if tools else None,
+            tool_choice="auto" if tools else None
+        )
+
+        message = response.choices[0].message
+        self.history.append(message.model_dump())
+
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.function.name
+                arguments_str = tool_call.function.arguments
+
+                try:
+                    tool_args = json.loads(arguments_str)
+                    tool = self.tools_registry.get(tool_name)
+
+                    if not tool:
+                        result = f"Error: Tool {tool_name} not found"
+                    else:
+                        if tool_name in DANGEROUS_TOOLS and self.confirmation_callback:
+                            confirmed = await self.confirmation_callback(tool_name, tool_args)
+                            if not confirmed:
+                                result = "Tool execution cancelled by user."
+                            else:
+                                validated_args = tool.validate_args(tool_args)
+                                result = await tool.run(validated_args)
+                        else:
+                            validated_args = tool.validate_args(tool_args)
+                            result = await tool.run(validated_args)
+
+                except json.JSONDecodeError:
+                    result = f"Error: Invalid JSON arguments for {tool_name}"
+                except Exception as e:
+                    log.error(f"tool {tool_name} error: {e}")
+                    result = f"Error executing tool {tool_name}: {e}"
+
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_name,
+                    "content": str(result)
+                })
+
+            return await self._step()
+
+        return message.content or ""
+
+    def _get_openai_tools(self) -> List[ChatCompletionToolParam]:
+        schemas = self.tools_registry.get_openai_schemas()
+        return schemas
