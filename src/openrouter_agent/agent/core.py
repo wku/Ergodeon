@@ -19,6 +19,27 @@ from openrouter_agent.utils import find_balanced_json
 
 log = logging.getLogger(__name__)
 
+def get_latest_stage_version(project_dir: str) -> tuple[int, int]:
+    base = os.path.join(project_dir, "флоу-разработки")
+    if not os.path.exists(base):
+         return 0, 0
+    stages = [d for d in os.listdir(base) if d.startswith("стейдж-") and os.path.isdir(os.path.join(base, d))]
+    if not stages:
+         return 0, 0
+    max_stage = max([int(s.split("-")[1]) for s in stages if s.split("-")[1].isdigit()], default=0)
+    if max_stage == 0:
+         return 0, 0
+         
+    stage_dir = os.path.join(base, f"стейдж-{max_stage}")
+    if not os.path.exists(stage_dir):
+         return max_stage, 0
+    versions = [d for d in os.listdir(stage_dir) if d.startswith("версия-") and os.path.isdir(os.path.join(stage_dir, d))]
+    if not versions:
+         return max_stage, 0
+    max_version = max([int(v.split("-")[1]) for v in versions if v.split("-")[1].isdigit()], default=0)
+    return max_stage, max_version
+
+
 DANGEROUS_TOOLS = {
     "write_file", "delete_file", "edit_file", "edit_file_by_lines",
     "move_file", "execute_command", "multi_edit_file"
@@ -123,10 +144,12 @@ class Agent:
         log.info(f"pipeline started: project={project_dir}, goal={goal[:100]}")
         result = {"status": "started", "stages": {}}
 
-        # Поиск старого контекста, если папка уже существует
+        # Определение текущего стейджа и версии
+        max_stage, max_version = get_latest_stage_version(project_dir)
         old_context = ""
-        docs_dir = os.path.join(project_dir, self.pipeline_config.docs_dir_name)
-        if os.path.exists(docs_dir):
+        
+        if max_stage > 0 and max_version > 0:
+            docs_dir = os.path.join(project_dir, "флоу-разработки", f"стейдж-{max_stage}", f"версия-{max_version}")
             try:
                 with open(os.path.join(docs_dir, "parsed_request.json"), "r", encoding="utf-8") as f:
                     old_req = f.read()
@@ -139,6 +162,12 @@ class Agent:
                     old_context += f"ТЕКУЩИЙ ЧЕКЛИСТ:\n{old_cl}\n\nВАЖНО: Добавь новые задачи в этот чеклист. Старые задачи сохрани как есть (если они не отменены)!"
             except FileNotFoundError:
                 pass
+            current_stage = max_stage + 1
+        else:
+            current_stage = 1
+            
+        current_version = 1
+        docs_dir = os.path.join(project_dir, "флоу-разработки", f"стейдж-{current_stage}", f"версия-{current_version}")
 
         # etap 1 - parsning zaprosa
         log.info("stage 1: parsing request")
@@ -198,7 +227,7 @@ class Agent:
             "walkthrough": walkthrough,
             "plan": plan,
         }
-        docs_dir = self.doc_generator.save_to_project(project_dir, docs)
+        self.doc_generator.save_to_project(docs_dir, docs)
         result["stages"]["documents"] = {"path": docs_dir, "valid": valid, "issues": issues}
 
         # etap 5 - revyu klientom
@@ -212,7 +241,7 @@ class Agent:
                     f"Или напишите комментарии ниже в чате. Отправьте комментарии или напишите 'ok' для продолжения."
                 )
                 
-                inline_comments = self.doc_generator.extract_inline_comments(project_dir)
+                inline_comments = self.doc_generator.extract_inline_comments(docs_dir)
                 
                 all_comments = []
                 if comments_cli and comments_cli.strip().lower() not in ("ok", "approved", "да", ""):
@@ -242,6 +271,9 @@ class Agent:
                     return result
 
                 to_regen = review_result.get("documents_to_regenerate", [])
+                if to_regen:
+                    current_version += 1
+                    docs_dir = os.path.join(project_dir, "флоу-разработки", f"стейдж-{current_stage}", f"версия-{current_version}")
                 if "checklist" in to_regen:
                     checklist = await self.doc_generator.generate_checklist(
                         digest_str, parsed_str + f"\nКомментарии: {comments}",
@@ -281,14 +313,12 @@ class Agent:
                 docs["checklist"] = checklist
                 docs["walkthrough"] = walkthrough
                 docs["plan"] = plan
-                self.doc_generator.save_to_project(project_dir, docs)
+                self.doc_generator.save_to_project(docs_dir, docs)
 
         # etap 6 - implementaciya
         log.info("stage 6: implementation")
-        snapshot_dir = Sandbox.snapshot(project_dir, os.path.join(
-            project_dir, self.pipeline_config.docs_dir_name,
-        ))
-        result["stages"]["snapshot"] = snapshot_dir
+        # snapshot_dir = Sandbox.snapshot(project_dir, docs_dir)
+        result["stages"]["snapshot"] = "skipped"
 
         execution_log = []
         steps = plan.get("steps", [])
@@ -315,6 +345,7 @@ class Agent:
                 })
                 continue
 
+            log.info(f"Начинаю выполнение шага {step_num}: {desc}")
             start = time.time()
             status = "completed"
             error = ""
@@ -329,14 +360,21 @@ class Agent:
                         previous_steps_log=json.dumps(execution_log, ensure_ascii=False)
                     )
                     
-                    self.history.append({"role": "system", "content": "You are executing a step in the implementation plan. Use your tools strictly."})
+                    system_instruction = (
+                        f"You are executing a step in the implementation plan.\n"
+                        f"IMPORTANT: The absolute root directory for this project is {project_dir}\n"
+                        f"All file paths in your tool calls (write_file, edit_file, execute_command, etc.) "
+                        f"MUST be relative to it or absolute paths inside {project_dir}. "
+                        f"Do NOT create or modify files outside {project_dir}. Use your tools strictly."
+                    )
+                    self.history.append({"role": "system", "content": system_instruction})
                     self.history.append({"role": "user", "content": prompt})
-                    response = await self._step()
+                    response = await self._step(project_dir=project_dir)
                     
                     status = "completed"
                     completed_ids.add(cid)
                     error = ""
-                    self.doc_generator.mark_step_completed(project_dir, cid, step_num)
+                    self.doc_generator.mark_step_completed(docs_dir, cid, step_num)
                     break
                 except Exception as e:
                     log.error(f"step {step_num} attempt {attempt+1} error: {e}")
@@ -353,7 +391,7 @@ class Agent:
                 "elapsed": round(elapsed, 2), "error": error,
             })
 
-        self.doc_generator.save_execution_log(project_dir, execution_log)
+        self.doc_generator.save_execution_log(docs_dir, execution_log)
         result["stages"]["execution"] = execution_log
 
         # etap 7 - finalnaya verifikaciya
@@ -389,7 +427,7 @@ class Agent:
         log.info(f"pipeline finished: {result['status']}")
         return result
 
-    async def _step(self) -> str:
+    async def _step(self, project_dir: str | None = None) -> str:
         messages = [{"role": "system", "content": self.system_prompt}] + self.history
         tools = self._get_openai_tools()
 
@@ -410,11 +448,24 @@ class Agent:
 
                 try:
                     tool_args = json.loads(arguments_str)
+                    
+                    if project_dir:
+                        for k, v in list(tool_args.items()):
+                            if k in ("path", "directory", "source", "destination", "cwd") and isinstance(v, str):
+                                if not os.path.isabs(v):
+                                    tool_args[k] = os.path.normpath(os.path.join(project_dir, v))
+                                elif not v.startswith(project_dir):
+                                    relative = v.lstrip("/")
+                                    tool_args[k] = os.path.normpath(os.path.join(project_dir, relative))
+                        if tool_name == "execute_command" and "cwd" not in tool_args:
+                            tool_args["cwd"] = project_dir
+
                     tool = self.tools_registry.get(tool_name)
 
                     if not tool:
                         result = f"Error: Tool {tool_name} not found"
                     else:
+                        log.info(f"Использую инструмент: [cyan]{tool_name}[/cyan] с аргументами: {tool_args}")
                         if tool_name in DANGEROUS_TOOLS and self.confirmation_callback:
                             confirmed = await self.confirmation_callback(tool_name, tool_args)
                             if not confirmed:
@@ -439,7 +490,7 @@ class Agent:
                     "content": str(result)
                 })
 
-            return await self._step()
+            return await self._step(project_dir=project_dir)
 
         return message.content or ""
 

@@ -98,8 +98,7 @@ class DocumentGenerator:
 
         return len(issues) == 0, issues
 
-    def save_to_project(self, project_dir: str, docs: Dict[str, Any]) -> str:
-        docs_dir = os.path.join(project_dir, self.config.docs_dir_name)
+    def save_to_project(self, docs_dir: str, docs: Dict[str, Any]) -> str:
         os.makedirs(docs_dir, exist_ok=True)
 
         if "parsed_request" in docs:
@@ -126,14 +125,13 @@ class DocumentGenerator:
                 f.write("# Обратная связь и комментарии\n\n")
                 f.write("Вы можете оставлять комментарии прямо в markdown документах (`checklist.md`, `walkthrough.md`, `implementation_plan.md`) с помощью следующего формата:\n\n")
                 f.write("```markdown\n<!-- COMMENT: ваш текст комментария -->\n```\n\n")
-                f.write("Размещайте этот тег 바로 **после строки или блока**, к которому относится комментарий.\n")
+                f.write("Размещайте этот тег сразу **после строки или блока**, к которому относится комментарий.\n")
                 f.write("Агент соберет эти комментарии, проанализирует их, и обновит документы.\n")
 
         log.info(f"docs saved to {docs_dir}")
         return docs_dir
 
-    def extract_inline_comments(self, project_dir: str) -> str:
-        docs_dir = os.path.join(project_dir, self.config.docs_dir_name)
+    def extract_inline_comments(self, docs_dir: str) -> str:
         if not os.path.exists(docs_dir):
             return ""
 
@@ -166,8 +164,7 @@ class DocumentGenerator:
                     
         return "\n\n".join(extracted)
 
-    def save_execution_log(self, project_dir: str, log_entries: List[Dict]) -> str:
-        docs_dir = os.path.join(project_dir, self.config.docs_dir_name)
+    def save_execution_log(self, docs_dir: str, log_entries: List[Dict]) -> str:
         os.makedirs(docs_dir, exist_ok=True)
         log_path = os.path.join(docs_dir, "execution_log.md")
 
@@ -200,8 +197,7 @@ class DocumentGenerator:
         log.info(f"execution log saved to {log_path}")
         return log_path
 
-    def mark_step_completed(self, project_dir: str, checklist_id: str, step_number: str):
-        docs_dir = os.path.join(project_dir, self.config.docs_dir_name)
+    def mark_step_completed(self, docs_dir: str, checklist_id: str, step_number: str):
         if not os.path.exists(docs_dir):
             return
 

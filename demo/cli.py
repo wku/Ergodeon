@@ -1,9 +1,11 @@
 import asyncio
 import os
 import sys
+import logging
 from typing import Any
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
@@ -36,6 +38,12 @@ async def confirmation_callback(tool_name: str, args: Any) -> bool:
     return result
 
 async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=console, markup=True)]
+    )
     load_dotenv()
     
     api_key = os.getenv("OPENROUTER_API_KEY")
