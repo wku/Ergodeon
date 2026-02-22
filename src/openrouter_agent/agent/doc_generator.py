@@ -123,15 +123,48 @@ class DocumentGenerator:
         review_path = os.path.join(docs_dir, "review_comments.md")
         if not os.path.exists(review_path):
             with open(review_path, "w", encoding="utf-8") as f:
-                f.write("# Комментарии к документам\n\n")
-                f.write("Формат комментария:\n")
-                f.write("> COMMENT: ваш комментарий к документу\n")
-                f.write("> TARGET: checklist / walkthrough / plan\n")
-                f.write("> TYPE: approve / minor_edit / major_change\n\n")
-                f.write("---\n\n")
+                f.write("# Обратная связь и комментарии\n\n")
+                f.write("Вы можете оставлять комментарии прямо в markdown документах (`checklist.md`, `walkthrough.md`, `implementation_plan.md`) с помощью следующего формата:\n\n")
+                f.write("```markdown\n<!-- COMMENT: ваш текст комментария -->\n```\n\n")
+                f.write("Размещайте этот тег 바로 **после строки или блока**, к которому относится комментарий.\n")
+                f.write("Агент соберет эти комментарии, проанализирует их, и обновит документы.\n")
 
         log.info(f"docs saved to {docs_dir}")
         return docs_dir
+
+    def extract_inline_comments(self, project_dir: str) -> str:
+        docs_dir = os.path.join(project_dir, self.config.docs_dir_name)
+        if not os.path.exists(docs_dir):
+            return ""
+
+        extracted = []
+        md_files = ["checklist.md", "walkthrough.md", "implementation_plan.md"]
+        
+        for md_file in md_files:
+            file_path = os.path.join(docs_dir, md_file)
+            if not os.path.exists(file_path):
+                continue
+                
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                
+            new_lines = []
+            file_comments = []
+            
+            for i, line in enumerate(lines):
+                if "<!-- COMMENT:" in line:
+                    comment_text = line.split("<!-- COMMENT:")[1].split("-->")[0].strip()
+                    context = lines[i-1].strip() if i > 0 else "Начало документа"
+                    file_comments.append(f"В файле {md_file}, к строке '{context}':\n> {comment_text}")
+                else:
+                    new_lines.append(line)
+                    
+            if file_comments:
+                extracted.extend(file_comments)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+                    
+        return "\n\n".join(extracted)
 
     def save_execution_log(self, project_dir: str, log_entries: List[Dict]) -> str:
         docs_dir = os.path.join(project_dir, self.config.docs_dir_name)
@@ -167,6 +200,45 @@ class DocumentGenerator:
         log.info(f"execution log saved to {log_path}")
         return log_path
 
+    def mark_step_completed(self, project_dir: str, checklist_id: str, step_number: str):
+        docs_dir = os.path.join(project_dir, self.config.docs_dir_name)
+        if not os.path.exists(docs_dir):
+            return
+
+        # Обновление checklist.md
+        checklist_path = os.path.join(docs_dir, "checklist.md")
+        if os.path.exists(checklist_path):
+            with open(checklist_path, "r", encoding="utf-8") as f:
+                cl_lines = f.readlines()
+            for i, line in enumerate(cl_lines):
+                if line.startswith("- [ ]") and f"**{checklist_id}**" in line:
+                    cl_lines[i] = line.replace("- [ ]", "- [x]", 1)
+            with open(checklist_path, "w", encoding="utf-8") as f:
+                f.writelines(cl_lines)
+
+        # Обновление implementation_plan.md
+        plan_path = os.path.join(docs_dir, "implementation_plan.md")
+        if os.path.exists(plan_path):
+            with open(plan_path, "r", encoding="utf-8") as f:
+                pl_lines = f.readlines()
+            for i, line in enumerate(pl_lines):
+                if line.startswith("### Шаг") and f"[{checklist_id}]" in line and str(step_number) in line:
+                    pl_lines[i] = line.replace("### Шаг", "### [x] Шаг", 1)
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.writelines(pl_lines)
+                
+        # Также обновить JSON-файлы, чтобы LLM знала статус при следующей итерации
+        cl_json_path = os.path.join(docs_dir, "checklist.json")
+        if os.path.exists(cl_json_path):
+            try:
+                cl_data = load_json(cl_json_path)
+                for task in cl_data.get("checklist", []):
+                    if task.get("id") == checklist_id:
+                        task["status"] = "completed"
+                save_json(cl_json_path, cl_data)
+            except Exception as e:
+                log.error(f"Failed to update checklist.json: {e}")
+
     def _save_checklist_md(self, docs_dir: str, checklist: Dict):
         path = os.path.join(docs_dir, "checklist.md")
         lines = ["# Чеклист задач\n\n"]
@@ -181,7 +253,9 @@ class DocumentGenerator:
             desc = task.get("description", "")
             deps = task.get("depends_on", [])
             criteria = task.get("acceptance_criteria", "")
-            lines.append(f"- [ ] **{tid}** {title}")
+            status = task.get("status", "pending")
+            marker = "x" if status == "completed" else " "
+            lines.append(f"- [{marker}] **{tid}** {title}")
             lines.append(f"  - {desc}")
             if deps:
                 lines.append(f"  - Зависит от: {', '.join(deps)}")

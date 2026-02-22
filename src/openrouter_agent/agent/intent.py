@@ -9,12 +9,13 @@ from openrouter_agent.utils import find_balanced_json
 log = logging.getLogger(__name__)
 
 INTENT_KEYWORDS = {
-    "create": ["create", "make", "write", "build", "generate"],
-    "edit": ["edit", "modify", "change", "update"],
-    "run": ["run", "execute", "start"],
-    "explain": ["explain", "what does", "describe"],
-    "test": ["test", "verify", "check"],
-    "optimize": ["optimize", "improve", "refactor"],
+    "pipeline": ["pipeline", "project", "application", "platform", "system", "service", "проект", "приложение", "сервис", "систему"],
+    "create": ["create", "make", "write", "build", "generate", "создай", "напиши"],
+    "edit": ["edit", "modify", "change", "update", "измени", "обнови", "добавь"],
+    "run": ["run", "execute", "start", "запусти", "выполни"],
+    "explain": ["explain", "what does", "describe", "объясни", "что делает"],
+    "test": ["test", "verify", "check", "проверь", "протестируй"],
+    "optimize": ["optimize", "improve", "refactor", "оптимизируй", "улучши"],
 }
 
 
@@ -49,7 +50,8 @@ class IntentClassifier:
     async def _llm_fallback(self, goal: str, client: AsyncOpenAI, model: str) -> Optional[str]:
         prompt = (
             "You are a strict JSON responder. Classify the user's intent into one of: "
-            "create, edit, run, explain, test, optimize.\n"
+            "pipeline, create, edit, run, explain, test, optimize.\n"
+            "Use 'pipeline' if the user wants to start a new project, application, or large system.\n"
             'Return ONLY JSON like: {"intent":"create","confidence":0.95}\n'
             f"User text: {goal}"
         )

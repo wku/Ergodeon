@@ -42,6 +42,7 @@ class PipelineConfig:
     ])
 
     docs_dir_name: str = "project_docs"
+    projects_dir: str = "projects"
 
     @classmethod
     def from_env(cls) -> "PipelineConfig":

@@ -14,6 +14,8 @@ from openrouter_agent.agent.scanner import ProjectScanner
 from openrouter_agent.agent.doc_generator import DocumentGenerator
 from openrouter_agent.agent.sandbox import Sandbox
 from openrouter_agent.agent.config import PipelineConfig
+from openrouter_agent.agent.prompts import PROMPT_EXECUTE_STEP
+from openrouter_agent.utils import find_balanced_json
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +55,40 @@ class Agent:
 
         log.info(f"agent initialized, model={model}, memory={memory_path}")
 
+    async def detect_pipeline_request(self, user_input: str) -> bool:
+        intent = await self.intent_classifier.classify_with_llm(user_input, self.client, self.model)
+        return intent == "pipeline"
+
+    async def create_project_dir(self, goal: str) -> str:
+        prompt = (
+            "You are a strict JSON responder. Based on the user's project request, "
+            "generate a short, snake_case or kebab-case directory name for the project.\n"
+            'Return ONLY JSON like: {"dir_name": "my_new_project"}\n'
+            f"Request: {goal}"
+        )
+        try:
+            r = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            raw = r.choices[0].message.content or ""
+            js = find_balanced_json(raw)
+            if js:
+                name = json.loads(js).get("dir_name", "new_project")
+            else:
+                name = "new_project"
+        except Exception as e:
+            log.warning(f"Error generating name: {e}")
+            name = "new_project"
+            
+        name = f"{name}_{int(time.time())}"
+        
+        base_dir = os.path.abspath(self.pipeline_config.projects_dir)
+        project_dir = os.path.join(base_dir, name)
+        os.makedirs(project_dir, exist_ok=True)
+        return project_dir
+
     async def chat(self, user_input: str) -> str:
         intent = self.intent_classifier.classify(user_input)
         log.info(f"intent: {intent}, input: {user_input[:100]}")
@@ -87,9 +123,31 @@ class Agent:
         log.info(f"pipeline started: project={project_dir}, goal={goal[:100]}")
         result = {"status": "started", "stages": {}}
 
+        # Поиск старого контекста, если папка уже существует
+        old_context = ""
+        docs_dir = os.path.join(project_dir, self.pipeline_config.docs_dir_name)
+        if os.path.exists(docs_dir):
+            try:
+                with open(os.path.join(docs_dir, "parsed_request.json"), "r", encoding="utf-8") as f:
+                    old_req = f.read()
+                    old_context += f"ПРЕДЫДУЩИЙ ЗАПРОС:\n{old_req}\n\n"
+            except FileNotFoundError:
+                pass
+            try:
+                with open(os.path.join(docs_dir, "checklist.json"), "r", encoding="utf-8") as f:
+                    old_cl = f.read()
+                    old_context += f"ТЕКУЩИЙ ЧЕКЛИСТ:\n{old_cl}\n\nВАЖНО: Добавь новые задачи в этот чеклист. Старые задачи сохрани как есть (если они не отменены)!"
+            except FileNotFoundError:
+                pass
+
         # etap 1 - parsning zaprosa
         log.info("stage 1: parsing request")
-        parsed = await self.doc_generator.parse_request(goal, "", self.client, self.model)
+        if old_context:
+            goal_with_ctx = f"Новый запрос: {goal}\n\n---\nИстория проекта:\n{old_context}"
+        else:
+            goal_with_ctx = goal
+            
+        parsed = await self.doc_generator.parse_request(goal_with_ctx, "", self.client, self.model)
         result["stages"]["parse_request"] = parsed
         if parsed.get("clarification_needed"):
             result["status"] = "needs_clarification"
@@ -146,16 +204,29 @@ class Agent:
         # etap 5 - revyu klientom
         if review_callback:
             log.info("stage 5: requesting review")
-            for iteration in range(self.pipeline_config.max_review_iterations):
-                comments = await review_callback(
+            while True:
+                comments_cli = await review_callback(
                     f"Документы сгенерированы в {docs_dir}. "
-                    f"Проверьте checklist.md, walkthrough.md, implementation_plan.md. "
-                    f"Оставьте комментарии или напишите 'ok' для продолжения."
+                    f"Проверьте checklist.md, walkthrough.md, implementation_plan.md.\n"
+                    f"Оставьте `<!-- COMMENT: текст -->` прямо в файлах (будут удалены после прочтения агентом)\n"
+                    f"Или напишите комментарии ниже в чате. Отправьте комментарии или напишите 'ok' для продолжения."
                 )
-                if not comments or comments.strip().lower() in ("ok", "approved", "да"):
+                
+                inline_comments = self.doc_generator.extract_inline_comments(project_dir)
+                
+                all_comments = []
+                if comments_cli and comments_cli.strip().lower() not in ("ok", "approved", "да", ""):
+                    all_comments.append(f"Комментарии из чата:\n{comments_cli}")
+                if inline_comments:
+                    all_comments.append(f"Inline комментарии из документов:\n{inline_comments}")
+                    
+                comments = "\n\n".join(all_comments)
+                
+                if not comments:
                     log.info("review: approved")
                     break
-                log.info(f"review iteration {iteration+1}: processing comments")
+                    
+                log.info(f"review processing comments")
                 review_result = await self.doc_generator.parse_review_comments(
                     comments,
                     json.dumps(checklist, ensure_ascii=False),
@@ -251,12 +322,21 @@ class Agent:
             for attempt in range(self.pipeline_config.max_retry_per_step):
                 try:
                     step_prompt = json.dumps(step, ensure_ascii=False)
-                    response = await self.chat(
-                        f"Выполни следующий шаг плана имплементации в проекте {project_dir}:\n{step_prompt}"
+                    prompt = PROMPT_EXECUTE_STEP.format(
+                        step=step_prompt,
+                        project_digest=digest_str,
+                        current_file_content="Определи сам в процессе",
+                        previous_steps_log=json.dumps(execution_log, ensure_ascii=False)
                     )
+                    
+                    self.history.append({"role": "system", "content": "You are executing a step in the implementation plan. Use your tools strictly."})
+                    self.history.append({"role": "user", "content": prompt})
+                    response = await self._step()
+                    
                     status = "completed"
                     completed_ids.add(cid)
                     error = ""
+                    self.doc_generator.mark_step_completed(project_dir, cid, step_num)
                     break
                 except Exception as e:
                     log.error(f"step {step_num} attempt {attempt+1} error: {e}")

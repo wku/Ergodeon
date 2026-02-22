@@ -61,6 +61,33 @@ async def main():
             
             status.start()
             try:
+                is_pipeline = await agent.detect_pipeline_request(user_input)
+            finally:
+                status.stop()
+
+            if is_pipeline:
+                confirmed = Confirm.ask("\n[bold yellow]Похоже, что это задача для пайплайна. Запустить пайплайн генерации проекта?[/bold yellow]")
+                if confirmed:
+                    project_dir = await agent.create_project_dir(user_input)
+                    console.print(f"[green]Проект будет создан в: {project_dir}[/green]")
+                    
+                    async def review_callback(msg: str) -> str:
+                        status.stop()
+                        console.print(f"\n[bold blue]АГЕНТ:[/bold blue] {msg}")
+                        user_resp = Prompt.ask("[bold user]Ваш ответ (или 'ok')[/bold user]")
+                        status.start()
+                        return user_resp
+
+                    status.start()
+                    try:
+                        result = await agent.run_pipeline(project_dir, user_input, review_callback)
+                        console.print(f"\n[bold green]Пайплайн завершен со статусом:[/bold green] {result['status']}")
+                    finally:
+                        status.stop()
+                    continue
+
+            status.start()
+            try:
                 response = await agent.chat(user_input)
             finally:
                 status.stop()
