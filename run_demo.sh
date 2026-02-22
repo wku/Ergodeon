@@ -1,10 +1,8 @@
 #!/bin/bash
 set -e
 
-# Change to the script directory
 cd "$(dirname "$0")"
 
-# Check if uv is installed
 if ! command -v uv &> /dev/null; then
     echo "uv could not be found. Please install it first."
     echo "Visit https://github.com/astral-sh/uv for installation instructions."
@@ -12,19 +10,19 @@ if ! command -v uv &> /dev/null; then
     exit 1
 fi
 
-# Load environment variables if .env exists
 if [ -f .env ]; then
-    export $(cat .env | xargs)
+    export $(cat .env | grep -v '^#' | xargs)
 fi
 
 if [ -z "$OPENROUTER_API_KEY" ]; then
     echo "⚠️  OPENROUTER_API_KEY is not set. The demo will ask for it."
 fi
 
-echo "🚀 Starting OpenRouter Agent Demo with uv..."
+echo "🚀 Starting Ergodeon Agent..."
 
-# Run the demo using uv
-# --active matches behavior of virtualenv activation if needed, but 'uv run' handles it
-# We install the project in editable mode implicitly or explicitly
-# 'uv run' finds pyproject.toml and creates venv if needed
-uv run python -m demo.cli
+# Передаём все аргументы напрямую в cli.py
+# Примеры:
+#   ./run_demo.sh                                      # обычный запуск
+#   ./run_demo.sh --project ./projects/my-project      # открыть существующий проект
+#   ./run_demo.sh --resume  ./projects/my-project      # сразу возобновить прерванный пайплайн
+uv run python -m demo.cli "$@"
