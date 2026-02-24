@@ -14,3 +14,4 @@ archive/
 *.swo
 projects/
 memory/episodes.json
+web/node_modules/

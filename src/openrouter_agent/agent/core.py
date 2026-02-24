@@ -73,6 +73,16 @@ def _resolve_and_guard(raw_path: str, project_dir: str) -> str:
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+PROMPTS_DIR = Path(__file__).parent.parent.parent.parent / "promt"
+
+def _load_prompt(name: str) -> str:
+    path = PROMPTS_DIR / f"{name}.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        log.error(f"Prompt file not found: {path}")
+        return ""
+
 
 class Agent:
     def __init__(
@@ -92,10 +102,15 @@ class Agent:
         self.api_key = api_key
         self.tools_registry = ToolRegistry()
         self.history: List[ChatCompletionMessageParam] = []
-        self.system_prompt = system_prompt or (
+
+        system_base = _load_prompt("system_base")
+        default_sys_prompt = (
             "You are a helpful AI coding assistant. "
-            "You can read and write files, execute commands, and more."
+            "You can read and write files, execute commands, and more.\n\n"
+            f"{system_base}"
         )
+        self.system_prompt = system_prompt or default_sys_prompt
+
         self.confirmation_callback = confirmation_callback
         self.active_project_dir: str | None = None
 
@@ -140,7 +155,7 @@ class Agent:
         os.makedirs(project_dir, exist_ok=True)
         return project_dir
 
-    async def chat(self, user_input: str) -> str:
+    async def chat(self, user_input: str, mode: str = "chat") -> str:
         intent = self.intent_classifier.classify(user_input)
         log.info(f"intent: {intent}, input: {user_input[:100]}")
 
@@ -148,17 +163,15 @@ class Agent:
         if similar:
             log.info(f"similar episode found: {similar.get('goal', '')[:80]}")
 
-        if self.active_project_dir and not any(
-            "active_project_dir" in str(m.get("content", "")) for m in self.history[-3:]
-        ):
-            self.history.append({
-                "role": "system",
-                "content": (
-                    f"Текущий активный проект: {self.active_project_dir}\n"
-                    f"ВСЕ файловые операции выполнять ТОЛЬКО внутри этой директории. "
-                    f"Запрещено создавать или изменять файлы вне {self.active_project_dir}."
-                ),
-            })
+        if self.active_project_dir:
+            prompt_name = "research_mode" if mode == "research" else "chat_mode"
+            mode_prompt = _load_prompt(prompt_name).format(active_project_dir=self.active_project_dir)
+            
+            if not any(mode_prompt in str(m.get("content", "")) for m in self.history[-3:]):
+                self.history.append({
+                    "role": "system",
+                    "content": mode_prompt
+                })
 
         self.history.append({"role": "user", "content": user_input})
         start_time = time.time()
@@ -686,50 +699,54 @@ class Agent:
         )
 
         message = response.choices[0].message
-        self.history.append(message.model_dump())
+
+        # model_dump() включает tool_calls=None когда инструментов нет.
+        # Azure/некоторые провайдеры отклоняют такое сообщение если после него
+        # идут role=tool записи. Убираем None-поля перед добавлением в историю.
+        msg_dict = {k: v for k, v in message.model_dump().items() if v is not None}
+        self.history.append(msg_dict)
 
         if message.tool_calls:
             for tool_call in message.tool_calls:
                 tool_name = tool_call.function.name
                 arguments_str = tool_call.function.arguments
+                result = None
 
                 try:
                     tool_args = json.loads(arguments_str)
 
                     if project_dir:
+                        path_error = None
                         for k in list(tool_args.keys()):
                             if k in PATH_ARGS and isinstance(tool_args[k], str):
                                 try:
                                     tool_args[k] = _resolve_and_guard(tool_args[k], project_dir)
                                 except ValueError as path_err:
                                     log.error(str(path_err))
-                                    self.history.append({
-                                        "role": "tool",
-                                        "tool_call_id": tool_call.id,
-                                        "name": tool_name,
-                                        "content": f"ERROR: {path_err}",
-                                    })
-                                    continue
+                                    path_error = str(path_err)
+                                    break
+                        if path_error:
+                            result = f"ERROR: {path_error}"
+                        else:
+                            if tool_name == "execute_command" and "cwd" not in tool_args:
+                                tool_args["cwd"] = project_dir
 
-                        if tool_name == "execute_command" and "cwd" not in tool_args:
-                            tool_args["cwd"] = project_dir
-
-                    tool = self.tools_registry.get(tool_name)
-
-                    if not tool:
-                        result = f"Error: Tool {tool_name} not found"
-                    else:
-                        log.info(f"Использую инструмент: {tool_name} с аргументами: {tool_args}")
-                        if tool_name in DANGEROUS_TOOLS and self.confirmation_callback:
-                            confirmed = await self.confirmation_callback(tool_name, tool_args)
-                            if not confirmed:
-                                result = "Tool execution cancelled by user."
+                    if result is None:
+                        tool = self.tools_registry.get(tool_name)
+                        if not tool:
+                            result = f"Error: Tool {tool_name} not found"
+                        else:
+                            log.info(f"Использую инструмент: {tool_name} с аргументами: {tool_args}")
+                            if tool_name in DANGEROUS_TOOLS and self.confirmation_callback:
+                                confirmed = await self.confirmation_callback(tool_name, tool_args)
+                                if not confirmed:
+                                    result = "Tool execution cancelled by user."
+                                else:
+                                    validated_args = tool.validate_args(tool_args)
+                                    result = await tool.run(validated_args)
                             else:
                                 validated_args = tool.validate_args(tool_args)
                                 result = await tool.run(validated_args)
-                        else:
-                            validated_args = tool.validate_args(tool_args)
-                            result = await tool.run(validated_args)
 
                 except json.JSONDecodeError:
                     result = f"Error: Invalid JSON arguments for {tool_name}"
@@ -737,6 +754,8 @@ class Agent:
                     log.error(f"tool {tool_name} error: {e}")
                     result = f"Error executing tool {tool_name}: {e}"
 
+                # tool result ВСЕГДА добавляется для каждого tool_call -
+                # каждый tool_call_id должен иметь ровно один tool result
                 self.history.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
