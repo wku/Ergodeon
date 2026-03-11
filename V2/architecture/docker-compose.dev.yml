@@ -1,0 +1,50 @@
+# Kiro Agent System - Development Docker Compose
+version: '3.8'
+
+services:
+  kiro-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kiro-dev
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LOG_LEVEL=DEBUG
+      - DEBUG=true
+    volumes:
+      # Mount source code for hot reload
+      - ./src:/app/src
+      - ./core:/app/core
+      - ./agents:/app/agents
+      - ./models:/app/models
+      - ./tools:/app/tools
+      - ./utils:/app/utils
+      - ./tests:/app/tests
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.kiro:/app/.kiro
+      - ./workspace:/app/workspace
+    ports:
+      - "8000:8000"
+      - "5678:5678"  # debugpy port
+    depends_on:
+      - redis
+    networks:
+      - kiro-network
+    command: python -m src.main
+    stdin_open: true
+    tty: true
+
+  redis:
+    image: redis:7-alpine
+    container_name: kiro-redis-dev
+    ports:
+      - "6379:6379"
+    networks:
+      - kiro-network
+
+networks:
+  kiro-network:
+    driver: bridge

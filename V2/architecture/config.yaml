@@ -1,0 +1,89 @@
+# Kiro Agent System Configuration
+
+orchestrator:
+  max_concurrent_agents: 10
+  timeout: 300  # seconds
+  retry_attempts: 3
+  retry_delay: 5  # seconds
+
+memory:
+  db_path: "./data/chroma"
+  embedding_model: "text-embedding-3-small"
+  max_entries: 10000
+  retention_days: 30
+  collection_name: "kiro_memory"
+
+llm:
+  provider: "openai"  # "openai", "anthropic", or "openrouter"
+  model: "gpt-4-turbo-preview"
+  api_key: "${OPENAI_API_KEY}"
+  base_url: null  # For OpenRouter: "https://openrouter.ai/api/v1"
+  temperature: 0.7
+  max_tokens: 4000
+  timeout: 60
+
+agents:
+  general_task_execution:
+    enabled: true
+    tools: ["readFile", "readMultipleFiles", "listDirectory", "fsWrite", "fsAppend", "deleteFile", "editCode", "strReplace", "executeBash", "grepSearch", "fileSearch"]
+    max_iterations: 10
+    timeout: 300
+  
+  context_gatherer:
+    enabled: true
+    tools: ["readFile", "readMultipleFiles", "listDirectory", "grepSearch", "fileSearch"]
+    max_iterations: 5
+    timeout: 180
+  
+  spec_task_execution:
+    enabled: true
+    tools: ["readFile", "readMultipleFiles", "listDirectory", "fsWrite", "fsAppend", "deleteFile", "editCode", "strReplace", "executeBash", "grepSearch", "fileSearch"]
+    max_iterations: 15
+    timeout: 600
+  
+  feature_requirements_first_workflow:
+    enabled: true
+    tools: ["readFile", "readMultipleFiles", "listDirectory", "fsWrite", "grepSearch", "fileSearch"]
+    max_iterations: 10
+    timeout: 300
+  
+  feature_design_first_workflow:
+    enabled: true
+    tools: ["readFile", "readMultipleFiles", "listDirectory", "fsWrite", "grepSearch", "fileSearch"]
+    max_iterations: 10
+    timeout: 300
+  
+  bugfix_workflow:
+    enabled: true
+    tools: ["readFile", "readMultipleFiles", "listDirectory", "fsWrite", "grepSearch", "fileSearch"]
+    max_iterations: 10
+    timeout: 300
+  
+  custom_agent_creator:
+    enabled: true
+    tools: ["readFile", "readMultipleFiles", "listDirectory", "fsWrite", "fsAppend"]
+    max_iterations: 5
+    timeout: 180
+
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./logs/kiro.log"
+  max_size: 10485760  # 10MB
+  backup_count: 5
+
+security:
+  allowed_paths:
+    - "./workspace"
+    - "./.kiro"
+  blocked_paths:
+    - "/etc"
+    - "/sys"
+    - "/proc"
+  max_file_size: 10485760  # 10MB
+  allowed_commands:
+    - "npm"
+    - "yarn"
+    - "python"
+    - "pytest"
+    - "git"

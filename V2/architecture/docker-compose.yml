@@ -1,0 +1,116 @@
+# Ergodeon Agent System - Docker Compose
+version: '3.8'
+
+services:
+  # Main Ergodeon application
+  ergodeon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ergodeon-agent-system
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4-turbo-preview}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CHROMA_DB_PATH=/app/data/chroma
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.ergodeon:/app/.ergodeon
+      - ./workspace:/app/workspace
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - chromadb
+    networks:
+      - ergodeon-network
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  # Redis for state management (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: ergodeon-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - ergodeon-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  # ChromaDB standalone (optional - can use embedded)
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: ergodeon-chromadb
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - ergodeon-network
+    restart: unless-stopped
+
+  # Optional: FastAPI server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ergodeon-api
+    command: uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - REDIS_HOST=redis
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    ports:
+      - "8002:8000"
+    depends_on:
+      - redis
+      - chromadb
+    networks:
+      - ergodeon-network
+    restart: unless-stopped
+    profiles:
+      - api
+
+  # Optional: Streamlit UI
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    container_name: ergodeon-ui
+    environment:
+      - API_URL=http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    networks:
+      - ergodeon-network
+    restart: unless-stopped
+    profiles:
+      - ui
+
+volumes:
+  redis-data:
+    driver: local
+  chroma-data:
+    driver: local
+
+networks:
+  ergodeon-network:
+    driver: bridge

@@ -1,0 +1,35 @@
+# Core dependencies
+python>=3.11
+
+# Async
+asyncio
+aiofiles>=23.2.1
+
+# Data & Validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Vector DB
+chromadb>=0.4.22
+
+# LLM
+litellm>=1.17.0
+openai>=1.10.0
+anthropic>=0.18.0
+
+# Optional - API
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Optional - State persistence
+redis>=5.0.1
+
+# Optional - UI
+streamlit>=1.30.0
+
+# Development
+pytest>=8.0.0
+pytest-asyncio>=0.23.3
+black>=24.1.0
+ruff>=0.1.14
+mypy>=1.8.0
